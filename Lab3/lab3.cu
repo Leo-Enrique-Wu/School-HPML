@@ -1,11 +1,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <cmath>
+
+using namespace std;
 
 // g++-9 -std=c++11 -O3 -o lab3 lab3.cpp
-// nvcc -std=c++11 -o lab3 lab3.cu
+// nvcc -std=c++11 -lineinfo -g -o lab3 lab3.cu
+// cuda-memcheck ./lab3
 
-#define BLOCK_SIZE 12
+#define BLOCK_SIZE 16
 #define H 1024
 #define W 1024
 #define C 3
@@ -67,6 +71,7 @@ void naiveConvolution(const double* I_0, const double* F, double* O){
     // calc_O_Idx(int k, int y, int x, int h, int w)
     int idx_O = calc_O_Idx(idx_k, idx_y, idx_x, H, W);
     O[idx_O] = sum;
+    // printf("O[%d][%d][%d]=%f\n", idx_k, idx_y, idx_x, O[idx_O]);
     
   }
   
@@ -81,29 +86,57 @@ void convolutionWithSharedMemory(const double* I_0, const double* F, double* O){
   int idx_k = blockIdx.z;
   int blockIdx_x = blockIdx.x;
   int blockIdx_y = blockIdx.y;
-  int idx_c = threadIdx.z;
   int idx_delta_x = threadIdx.x;
   int idx_delta_y = threadIdx.y;
-  if(idx_c < C && idx_delta_x < FW && idx_delta_y < FH){
-    int idx_F = calc_F_Idx(idx_k, idx_c, idx_delta_y, idx_delta_x, C, FH, FW);
-    shared_F_k_0[idx_c][idx_delta_y][idx_delta_x] = F[idx_F];
+  if(idx_delta_x < FW && idx_delta_y < FH){
+    for(int idx_c = 0; idx_c < C; idx_c++){
+      int idx_F = calc_F_Idx(idx_k, idx_c, idx_delta_y, idx_delta_x, C, FH, FW);
+      shared_F_k_0[idx_c][idx_delta_y][idx_delta_x] = F[idx_F];
+      
+      /*
+      if(idx_k == 0 && blockIdx_x == 0 && blockIdx_y == 0){
+        // printf("F[%d][%d][%d] = %f\n", idx_c, idx_delta_y, idx_delta_x, shared_F_k_0[idx_c][idx_delta_y][idx_delta_x]);
+      }
+      */
+      
+    }
   }
   
   int idx_x_start = blockIdx_x * (BLOCK_SIZE - FW + 1);
-  int actual_x_BlockSize = (blockIdx_x == blockDim.x - 1)? (W - idx_x_start) : BLOCK_SIZE;
+  int actual_x_BlockSize = (blockIdx_x == gridDim.x - 1)? (I_0_W - idx_x_start) : BLOCK_SIZE;
+  int delta_x_exlude_end = actual_x_BlockSize - FW + 1;
+  /*
+  if(idx_k == 0 && blockIdx_x == 0 && blockIdx_y == 0 && idx_delta_x == 0 && idx_delta_y == 0){
+    // printf("gridDim.x=%d, idx_x_start=%d, actual_x_BlockSize=%d, delta_x_exlude_end=%d\n", gridDim.x, idx_x_start, actual_x_BlockSize, delta_x_exlude_end);
+  }
+  */
+    
   int idx_y_start = blockIdx_y * (BLOCK_SIZE - FH + 1);
-  int actual_y_BlockSize = (blockIdx_y == blockDim.y - 1)? (H - idx_y_start) : BLOCK_SIZE;
+  int actual_y_BlockSize = (blockIdx_y == gridDim.y - 1)? (I_0_H - idx_y_start) : BLOCK_SIZE;
+  int delta_y_exlude_end = actual_y_BlockSize - FH + 1;
+  /*
+  if(idx_k == 0 && blockIdx_x == 0 && blockIdx_y == 0 && idx_delta_x == 0 && idx_delta_y == 0){
+    // printf("gridDim.y=%d, idx_y_start=%d, actual_y_BlockSize=%d, delta_y_exlude_end=%d\n", gridDim.y , idx_y_start, actual_y_BlockSize, delta_y_exlude_end);
+  }
+  */
   
   __shared__ double shared_sub_I_0[C][BLOCK_SIZE][BLOCK_SIZE];
-  if(idx_c < C && idx_delta_x < actual_x_BlockSize && idx_delta_y < actual_y_BlockSize){
-    // calc_I_0_Idx(int c, int y, int x, int h, int w)
-    int idx_I_0 = calc_I_0_Idx(idx_c, idx_y_start + idx_delta_y, idx_x_start + idx_delta_x, I_0_H, I_0_W);
-    shared_sub_I_0[idx_c][idx_delta_y][idx_delta_x] = I_0[idx_I_0];
+  if(idx_delta_x < actual_x_BlockSize && idx_delta_y < actual_y_BlockSize){
+    for(int idx_c = 0; idx_c < C; idx_c++){
+      // calc_I_0_Idx(int c, int y, int x, int h, int w)
+      int idx_I_0 = calc_I_0_Idx(idx_c, idx_y_start + idx_delta_y, idx_x_start + idx_delta_x, I_0_H, I_0_W);
+      shared_sub_I_0[idx_c][idx_delta_y][idx_delta_x] = I_0[idx_I_0];
+      /*
+      if(idx_k == 0 && blockIdx_x == 0 && blockIdx_y == 1){
+        printf("I_0[%d][%d][%d] = %f\n", idx_c, idx_delta_y, idx_delta_x, shared_sub_I_0[idx_c][idx_delta_y][idx_delta_x]);
+      }
+      */
+    }
   }
   
   __syncthreads();
   
-  if(idx_k < K && idx_delta_x < actual_x_BlockSize && idx_delta_y < actual_y_BlockSize){
+  if(idx_k < K && idx_delta_x < delta_x_exlude_end && idx_delta_y < delta_y_exlude_end){
     
     int idx_x = idx_x_start + idx_delta_x;
     int idx_y = idx_y_start + idx_delta_y;
@@ -117,7 +150,13 @@ void convolutionWithSharedMemory(const double* I_0, const double* F, double* O){
       for(int idx_j = 0; idx_j < FH; idx_j++){
         for(int idx_i = 0; idx_i < FW; idx_i++){
               
-          sum += shared_F_k_0[idx_c][FH - 1 - idx_j][FW - 1 - idx_i] * shared_sub_I_0[idx_c][idx_y + idx_j][idx_x + idx_i];
+          sum += shared_F_k_0[idx_c][FH - 1 - idx_j][FW - 1 - idx_i] * shared_sub_I_0[idx_c][idx_delta_y + idx_j][idx_delta_x + idx_i];
+          
+          /*
+          if(idx_x == 0 && idx_y == 3 && idx_c == 1){
+            printf("I_0(%d, %d, %d) * F(%d, %d, %d) = %f * %f = %f: idx_delta_x=%d, idx_i=%d, idx_delta_y=%d, idx_j=%d, idx_c=%d, blockIdx_x=%d, blockIdx_y=%d\n", idx_c, idx_delta_x + idx_i, idx_delta_y + idx_j, idx_c, FW - 1 - idx_i, FH - 1 - idx_j, shared_sub_I_0[idx_c][idx_delta_y + idx_j][idx_delta_x + idx_i], shared_F_k_0[idx_c][FH - 1 - idx_j][FW - 1 - idx_i], shared_F_k_0[idx_c][FH - 1 - idx_j][FW - 1 - idx_i] * shared_sub_I_0[idx_c][idx_delta_y + idx_j][idx_delta_x + idx_i], idx_delta_x, idx_i, idx_delta_y, idx_j, idx_c, blockIdx_x, blockIdx_y);
+          }
+          */
               
         }
       }
@@ -126,11 +165,19 @@ void convolutionWithSharedMemory(const double* I_0, const double* F, double* O){
     // calc_O_Idx(int k, int y, int x, int h, int w)
     int idx_O = calc_O_Idx(idx_k, idx_y, idx_x, H, W);
     O[idx_O] = sum;
+    // printf("O[%d][%d][%d] = %f\n", idx_k, idx_y, idx_x, O[idx_O]);
     
   }
   
 }
 
+void check_CUDA_Error(const char *message){
+  cudaError_t error = cudaGetLastError();
+  if(error!=cudaSuccess) {
+    fprintf(stderr,"ERROR: %s: %s\n", message, cudaGetErrorString(error) );
+    exit(-1);
+  }
+}
 
 int main(int argc, char *argv[]){
   
@@ -143,7 +190,8 @@ int main(int argc, char *argv[]){
   // F: size K x C x FH x FW
   double* F = (double*)malloc(K * C * FH * FW * sizeof(double));
   // O: size K x H x W
-  double* O = (double*)malloc(K * H * W * sizeof(double));
+  double* O_C1 = (double*)malloc(K * H * W * sizeof(double));
+  double* O_C2 = (double*)malloc(K * H * W * sizeof(double));
   
   // init data
   // init I_0
@@ -188,22 +236,28 @@ int main(int argc, char *argv[]){
   
   // init O
   for(int idx_k = 0; idx_k < K; idx_k++){
-    for(int idx_y = 0; idx_y < I_0_H; idx_y++){
-      for(int idx_x = 0; idx_x < I_0_W; idx_x++){
+    for(int idx_y = 0; idx_y < H; idx_y++){
+      for(int idx_x = 0; idx_x < W; idx_x++){
         
         // calc_O_Idx(int k, int y, int x, int h, int w)
         int idx_O = calc_O_Idx(idx_k, idx_y, idx_x, H, W);
-        O[idx_O] = 0;
+        O_C1[idx_O] = 0;
+        O_C2[idx_O] = 0;
         
       }
     }
   }
   
   // allocate device memory
-  double *I_0_d, *F_d, *O_d;
+  double *I_0_d, *F_d, *O_C1_d, *O_C2_d;
   cudaMalloc(&I_0_d, C * I_0_W * I_0_H * sizeof(double));
+  check_CUDA_Error("malloc I_0 failed");
   cudaMalloc(&F_d, K * C * FH * FW * sizeof(double));
-  cudaMalloc(&O_d, K * H * W * sizeof(double));
+  check_CUDA_Error("malloc F failed");
+  cudaMalloc(&O_C1_d, K * H * W * sizeof(double));
+  check_CUDA_Error("malloc O_C1 failed");
+  cudaMalloc(&O_C2_d, K * H * W * sizeof(double));
+  check_CUDA_Error("malloc O_C2 failed");
   
   // copy memory from host to device
   cudaMemcpy(I_0_d, I_0, C * I_0_W * I_0_H * sizeof(double), cudaMemcpyHostToDevice);
@@ -216,14 +270,14 @@ int main(int argc, char *argv[]){
   clock_gettime(CLOCK_MONOTONIC, &start);
   
   // naiveConvolution(const double* I_0, const double* F, double* O, int I_0_h, int I_0_w, int c_num, int fh, int fw, int O_k, int O_w, int O_h)
-  naiveConvolution<<<GridDim, 1>>>(I_0_d, F_d, O_d);
+  naiveConvolution<<<GridDim, 1>>>(I_0_d, F_d, O_C1_d);
   cudaDeviceSynchronize();
   
   clock_gettime(CLOCK_MONOTONIC, &end);
   
   // wait for the complete
   // then, copy memory from device to host
-  cudaMemcpy(O, O_d, K * H * W * sizeof(double), cudaMemcpyDeviceToHost);
+  cudaMemcpy(O_C1, O_C1_d, K * H * W * sizeof(double), cudaMemcpyDeviceToHost);
   
   // print result
   // 1. checksum: the total sum of the elements of O
@@ -236,7 +290,7 @@ int main(int argc, char *argv[]){
         
         // calc_O_Idx(int k, int y, int x, int h, int w)
         int idx_O = calc_O_Idx(idx_k, idx_y, idx_x, H, W);
-        totalSum += O[idx_O];
+        totalSum += O_C1[idx_O];
         
       }
     }
@@ -249,15 +303,66 @@ int main(int argc, char *argv[]){
   printf("1. checksum = %f\n", totalSum);
   printf("2. Execution time = %f s\n", executionTime);
   
+  // C2
+  // calculate needed dimension
+  int blockNum_x = ceil(((double)(I_0_W - BLOCK_SIZE))/(BLOCK_SIZE - FW + 1)) + 1;
+  int blockNum_y = ceil(((double)(I_0_H - BLOCK_SIZE))/(BLOCK_SIZE - FH + 1)) + 1;
+  int blockNum_z = K;
+  int threadNum_x = BLOCK_SIZE;
+  int threadNum_y = BLOCK_SIZE;
+  dim3 gridDim_C2(blockNum_x, blockNum_y, blockNum_z);
+  dim3 blockDim_C2(threadNum_x, threadNum_y);
+  
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  // convolutionWithSharedMemory(const double* I_0, const double* F, double* O, int I_0_h, int I_0_w, int c_num, int fh, int fw, int O_k, int O_w, int O_h)
+  convolutionWithSharedMemory<<<gridDim_C2, blockDim_C2>>>(I_0_d, F_d, O_C2_d);
+  cudaDeviceSynchronize();
+  
+  clock_gettime(CLOCK_MONOTONIC, &end);
+  
+  // wait for the complete
+  // then, copy memory from device to host
+  cudaMemcpy(O_C2, O_C2_d, K * H * W * sizeof(double), cudaMemcpyDeviceToHost);
+  
+  // print result
+  // 1. checksum: the total sum of the elements of O
+  // Expected: checksum=122756344698240.000000
+  // 2. the time to execute the CUDA kernel with the convolution
+  totalSum = 0;
+  for(int idx_k = 0; idx_k < K; idx_k++){
+    for(int idx_y = 0; idx_y < H; idx_y++){
+      for(int idx_x = 0; idx_x < W; idx_x++){
+        
+        // calc_O_Idx(int k, int y, int x, int h, int w)
+        int idx_O = calc_O_Idx(idx_k, idx_y, idx_x, H, W);
+        totalSum += O_C2[idx_O];
+        
+      }
+    }
+  }
+  
+  executionTime = (end.tv_sec - start.tv_sec) * 1e9;
+  executionTime = (executionTime + (end.tv_nsec - start.tv_nsec)) * 1e-9;
+  
+  printf("C2(Tiled Convolution with CUDA):\n");
+  printf("1. checksum = %f\n", totalSum);
+  printf("2. Execution time = %f s\n", executionTime);
+  
   // free device memory
   // free host memory
   cudaFree(I_0_d);
+  check_CUDA_Error("free I_0 failed");
   cudaFree(F_d);
-  cudaFree(O_d);
-        
+  check_CUDA_Error("free F failed");
+  cudaFree(O_C1_d);
+  check_CUDA_Error("free O_C1 failed");
+  cudaFree(O_C2_d);
+  check_CUDA_Error("free O_C2 failed");
+  
+  free(O_C1);
+  free(O_C2);
   free(F);
-  free(O);
-  // free(I_0);
+  free(I_0);
   
   return 0;
   
