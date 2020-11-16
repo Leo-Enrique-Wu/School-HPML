@@ -2,11 +2,13 @@
 #include <stdlib.h>
 #include <time.h>
 #include <cmath>
+#include <cudnn.h>
+#include <assert.h>
 
 using namespace std;
 
 // g++-9 -std=c++11 -O3 -o lab3 lab3.cpp
-// nvcc -std=c++11 -lineinfo -g -o lab3 lab3.cu
+// nvcc -std=c++11 -lcudnn -g -o lab3 lab3.cu
 // cuda-memcheck ./lab3
 
 #define BLOCK_SIZE 16
@@ -20,6 +22,15 @@ using namespace std;
 #define I_0_H (H + 2 * P)
 #define I_0_W (W + 2 * P)
 
+#define checkCUDNN(expression)                                 \
+{                                                              \
+    cudnnStatus_t status = (expression);                       \
+    if (status != CUDNN_STATUS_SUCCESS) {                      \
+      printf("Error on line %d: %s\n", __LINE__,               \
+                          cudnnGetErrorString(status));        \
+      std::exit(EXIT_FAILURE);                                 \
+    }                                                          \
+};
 
 __host__ __device__
 int calc_I_0_Idx(int c, int y, int x, int h, int w){
@@ -171,6 +182,100 @@ void convolutionWithSharedMemory(const double* I_0, const double* F, double* O){
   
 }
 
+// C3
+void convolutionUsingcuDNN(const double* I, const double* F, double* O){
+  
+  cudnnHandle_t cudnn;
+  checkCUDNN(cudnnCreate(&cudnn));
+  
+  cudnnTensorDescriptor_t input_descriptor; /* xDesc */
+  checkCUDNN(cudnnCreateTensorDescriptor(&input_descriptor));
+  checkCUDNN(cudnnSetTensor4dDescriptor(input_descriptor, CUDNN_TENSOR_NCHW, CUDNN_DATA_DOUBLE, 1, C, H, W));
+  
+
+  cudnnTensorDescriptor_t output_descriptor; /* yDesc */
+  checkCUDNN(cudnnCreateTensorDescriptor(&output_descriptor));
+  checkCUDNN(cudnnSetTensor4dDescriptor(output_descriptor, CUDNN_TENSOR_NCHW, CUDNN_DATA_DOUBLE, 1, K, H, W));
+
+  
+  cudnnFilterDescriptor_t kernel_descriptor; /* wDesc */
+  checkCUDNN(cudnnCreateFilterDescriptor(&kernel_descriptor));
+  checkCUDNN(cudnnSetFilter4dDescriptor(kernel_descriptor, CUDNN_DATA_DOUBLE, CUDNN_TENSOR_NCHW, K, C, FH, FW));
+  
+  cudnnConvolutionDescriptor_t convolution_descriptor;
+  checkCUDNN(cudnnCreateConvolutionDescriptor(&convolution_descriptor));
+  checkCUDNN(cudnnSetConvolution2dDescriptor(convolution_descriptor, P, P, 1, 1, 1, 1, CUDNN_CROSS_CORRELATION, CUDNN_DATA_DOUBLE));
+  
+  cudnnConvolutionFwdAlgo_t convolution_algorithm;
+  checkCUDNN(
+    cudnnGetConvolutionForwardAlgorithm(cudnn,
+                                        input_descriptor,       /* xDesc */
+                                        kernel_descriptor,      /* wDesc */
+                                        convolution_descriptor, /* convDesc */
+                                        output_descriptor,      /* yDesc */
+                                        CUDNN_CONVOLUTION_FWD_PREFER_FASTEST,
+                                        0,
+                                        &convolution_algorithm));
+  
+  size_t workspace_bytes = 0;
+  checkCUDNN(cudnnGetConvolutionForwardWorkspaceSize(cudnn,
+                                                   input_descriptor,
+                                                   kernel_descriptor,
+                                                   convolution_descriptor,
+                                                   output_descriptor,
+                                                   convolution_algorithm,
+                                                   &workspace_bytes));
+  // printf("Workspace size: %f\n", workspace_bytes);
+  
+  void* d_workspace{nullptr};
+  cudaMalloc(&d_workspace, workspace_bytes);
+
+  int input_bytes = C * H * W * sizeof(double);
+  double* I_d{nullptr};
+  cudaMalloc(&I_d, input_bytes);
+  cudaMemcpy(I_d, I, input_bytes, cudaMemcpyHostToDevice);
+
+  int output_bytes = K * H * W * sizeof(double);
+  double* O_C3_d{nullptr};
+  cudaMalloc(&O_C3_d, output_bytes);
+  cudaMemset(O_C3_d, 0, output_bytes);
+  
+  int filter_bytes = K * C * FH * FW * sizeof(double);
+  double* F_C3_d{nullptr};
+  cudaMalloc(&F_C3_d, filter_bytes);
+  cudaMemcpy(F_C3_d, F, filter_bytes, cudaMemcpyHostToDevice);
+  
+  const double alpha = 1, beta = 0;
+  checkCUDNN(cudnnConvolutionForward(cudnn,
+                                     &alpha,
+                                     input_descriptor,
+                                     I_d,
+                                     kernel_descriptor,
+                                     F_C3_d,
+                                     convolution_descriptor,
+                                     convolution_algorithm,
+                                     d_workspace,
+                                     workspace_bytes,
+                                     &beta,
+                                     output_descriptor,
+                                     O_C3_d));
+  
+  cudaMemcpy(O, O_C3_d, output_bytes, cudaMemcpyDeviceToHost);
+  
+  cudaFree(I_d);
+  cudaFree(F_C3_d);
+  cudaFree(O_C3_d);
+  cudaFree(d_workspace);
+
+  cudnnDestroyTensorDescriptor(input_descriptor);
+  cudnnDestroyTensorDescriptor(output_descriptor);
+  cudnnDestroyFilterDescriptor(kernel_descriptor);
+  cudnnDestroyConvolutionDescriptor(convolution_descriptor);
+  
+  cudnnDestroy(cudnn);
+  
+}
+
 void check_CUDA_Error(const char *message){
   cudaError_t error = cudaGetLastError();
   if(error!=cudaSuccess) {
@@ -186,12 +291,14 @@ int main(int argc, char *argv[]){
   
   // allocate host memory
   // I_0: size C x (H + 2P) x (W + 2P)
+  double* I = (double*)malloc(C * H * W * sizeof(double));
   double* I_0 = (double*)malloc(C * I_0_W * I_0_H * sizeof(double));
   // F: size K x C x FH x FW
   double* F = (double*)malloc(K * C * FH * FW * sizeof(double));
   // O: size K x H x W
   double* O_C1 = (double*)malloc(K * H * W * sizeof(double));
   double* O_C2 = (double*)malloc(K * H * W * sizeof(double));
+  double* O_C3 = (double*)malloc(K * H * W * sizeof(double));
   
   // init data
   // init I_0
@@ -211,6 +318,11 @@ int main(int argc, char *argv[]){
         }else{
           // 𝐼[𝑐,𝑥,𝑦]=𝑐∙(𝑥+𝑦)
           I_0[idx_I_0] = idx_c * (idx_I_x + idx_I_y);
+          
+          // calc_I_0_Idx(int c, int y, int x, int h, int w)
+          int idx_I = calc_I_0_Idx(idx_c, idx_I_y, idx_I_x, H, W);
+          I[idx_I] = idx_c * (idx_I_x + idx_I_y);
+          
         }
         
       }
@@ -243,6 +355,7 @@ int main(int argc, char *argv[]){
         int idx_O = calc_O_Idx(idx_k, idx_y, idx_x, H, W);
         O_C1[idx_O] = 0;
         O_C2[idx_O] = 0;
+        O_C3[idx_O] = 0;
         
       }
     }
@@ -296,12 +409,11 @@ int main(int argc, char *argv[]){
     }
   }
   
-  executionTime = (end.tv_sec - start.tv_sec) * 1e9;
-  executionTime = (executionTime + (end.tv_nsec - start.tv_nsec)) * 1e-9;
+  executionTime = (end.tv_sec - start.tv_sec) * 1e3;
+  executionTime = executionTime + ((end.tv_nsec - start.tv_nsec) * 1e-6);
   
-  printf("C1(Naive Convolution on GPU):\n");
-  printf("1. checksum = %f\n", totalSum);
-  printf("2. Execution time = %f s\n", executionTime);
+  printf("\n");
+  printf("%f,%.3f\n", totalSum, executionTime);
   
   // C2
   // calculate needed dimension
@@ -341,28 +453,58 @@ int main(int argc, char *argv[]){
     }
   }
   
-  executionTime = (end.tv_sec - start.tv_sec) * 1e9;
-  executionTime = (executionTime + (end.tv_nsec - start.tv_nsec)) * 1e-9;
+  executionTime = (end.tv_sec - start.tv_sec) * 1e3;
+  executionTime = executionTime + ((end.tv_nsec - start.tv_nsec) * 1e-6);
   
-  printf("C2(Tiled Convolution with CUDA):\n");
-  printf("1. checksum = %f\n", totalSum);
-  printf("2. Execution time = %f s\n", executionTime);
+  printf("\n");
+  printf("%f,%.3f\n", totalSum, executionTime);
+  
+  // C3
+  // convolutionUsingcuDNN(const double* I, const double* F, double* O)
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  convolutionUsingcuDNN(I, F, O_C3);
+  clock_gettime(CLOCK_MONOTONIC, &end);
+  
+  // print result
+  // 1. checksum: the total sum of the elements of O
+  // Expected: checksum=122756344698240.000000
+  // 2. the time to execute the CUDA kernel with the convolution
+  totalSum = 0;
+  for(int idx_k = 0; idx_k < K; idx_k++){
+    for(int idx_y = 0; idx_y < H; idx_y++){
+      for(int idx_x = 0; idx_x < W; idx_x++){
+        
+        // calc_O_Idx(int k, int y, int x, int h, int w)
+        int idx_O = calc_O_Idx(idx_k, idx_y, idx_x, H, W);
+        totalSum += O_C3[idx_O];
+        
+      }
+    }
+  }
+  
+  executionTime = (end.tv_sec - start.tv_sec) * 1e3;
+  executionTime = executionTime + ((end.tv_nsec - start.tv_nsec) * 1e-6);
+  
+  printf("\n");
+  printf("%f,%.3f\n", totalSum, executionTime);
   
   // free device memory
   // free host memory
   cudaFree(I_0_d);
-  check_CUDA_Error("free I_0 failed");
+  check_CUDA_Error("free I_0_d failed");
   cudaFree(F_d);
-  check_CUDA_Error("free F failed");
+  check_CUDA_Error("free F_d failed");
   cudaFree(O_C1_d);
-  check_CUDA_Error("free O_C1 failed");
+  check_CUDA_Error("free O_C1_d failed");
   cudaFree(O_C2_d);
-  check_CUDA_Error("free O_C2 failed");
+  check_CUDA_Error("free O_C2_d failed");
   
   free(O_C1);
   free(O_C2);
+  free(O_C3);
   free(F);
   free(I_0);
+  free(I);
   
   return 0;
   
